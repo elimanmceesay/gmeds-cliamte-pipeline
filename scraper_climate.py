@@ -87,14 +87,30 @@ def fetch_reliefweb_gambia(days=7):
         "sort": ["date.created:desc"],
         "limit": 20,
     }
-    resp = requests.post(RELIEFWEB_API, json=payload, timeout=30)
-    resp.raise_for_status()
+    url = f"{RELIEFWEB_API}?appname=gmeds-climate-monitor"
+    print(f"DEBUG requesting (POST): {url}")
+    try:
+        resp = requests.post(url, json=payload, timeout=30)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        # ReliefWeb has occasionally required the appname as a query param
+        # rather than only in the body; retry once with a plain GET query
+        # before giving up, so a single API quirk doesn't kill the whole run.
+        print(f"DEBUG POST failed ({e}); retrying with GET")
+        resp = requests.get(
+            RELIEFWEB_API,
+            params={"appname": "gmeds-climate-monitor", "filter[field]": "country", "filter[value]": "Gambia", "limit": 20},
+            timeout=30,
+        )
+        resp.raise_for_status()
     data = resp.json()
     return data.get("data", [])
 
 
 def fetch_world_bank(code):
-    resp = requests.get(WB_BASE.format(code=code), params={"format": "json", "per_page": 5}, timeout=30)
+    url = WB_BASE.format(code=code)
+    print(f"DEBUG requesting: {url}")
+    resp = requests.get(url, params={"format": "json", "per_page": 5}, timeout=30)
     resp.raise_for_status()
     payload = resp.json()
     if not isinstance(payload, list) or len(payload) < 2 or not payload[1]:
@@ -106,6 +122,7 @@ def fetch_world_bank(code):
 
 
 def fetch_cbg_readings():
+    print(f"DEBUG requesting: {CBG_HOME}")
     resp = requests.get(CBG_HOME, headers=UA, timeout=30)
     resp.raise_for_status()
     from bs4 import BeautifulSoup  # local import so the rest of the script works without bs4 if unused
@@ -127,6 +144,7 @@ def run():
 
     today = datetime.now(timezone.utc).date().isoformat()
     now = datetime.now(timezone.utc).isoformat()
+    any_success = False
 
     # 1. ReliefWeb — disaster/situation report count + alerts for review
     try:
@@ -135,6 +153,7 @@ def run():
             "metric": "reliefweb_reports_7d", "value": len(reports), "value_text": None,
             "observed_at": today, "source": "ReliefWeb", "fetched_at": now,
         }])
+        any_success = True
         alert_rows = []
         for r in reports:
             fields = r.get("fields", {})
@@ -148,7 +167,7 @@ def run():
         supabase_upsert("climate_alerts", alert_rows)
         print(f"ReliefWeb: {len(reports)} report(s) in the last 7 days")
     except Exception as e:
-        print(f"[warn] ReliefWeb fetch failed: {e}")
+        print(f"[warn] ReliefWeb fetch failed: {type(e).__name__}: {e}")
 
     # 2. World Bank indicators
     for code, metric in WB_INDICATORS.items():
@@ -160,9 +179,10 @@ def run():
                     "metric": metric, "value": value, "value_text": f"{year}",
                     "observed_at": today, "source": "World Bank", "fetched_at": now,
                 }])
+                any_success = True
                 print(f"{metric}: {value} ({year})")
         except Exception as e:
-            print(f"[warn] World Bank fetch failed for {code}: {e}")
+            print(f"[warn] World Bank fetch failed for {code}: {type(e).__name__}: {e}")
         time.sleep(0.3)
 
     # 3. CBG policy rate & inflation
@@ -173,11 +193,17 @@ def run():
             "observed_at": today, "source": "CBG", "fetched_at": now,
         } for k, v in readings.items()]
         supabase_upsert("climate_readings", rows)
+        if rows:
+            any_success = True
         print(f"CBG readings: {readings}")
     except Exception as e:
-        print(f"[warn] CBG fetch failed: {e}")
+        print(f"[warn] CBG fetch failed: {type(e).__name__}: {e}")
 
     print("Done. Unreviewed alerts are in climate_alerts — check the dashboard's Overview tab.")
+
+    if not any_success:
+        # Every source failed — don't report a false "Success" to GitHub Actions.
+        raise SystemExit("All data sources failed this run — see [warn] lines above for the real cause. Exiting with failure so this shows red, not green.")
 
 
 if __name__ == "__main__":
