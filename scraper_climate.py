@@ -34,6 +34,7 @@ Setup:
 import os
 import re
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -142,6 +143,9 @@ def run():
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         raise SystemExit("Set SUPABASE_URL and SUPABASE_SERVICE_KEY environment variables first.")
 
+    print(f"DEBUG SUPABASE_URL starts with 'https://': {SUPABASE_URL.startswith('https://')}, length: {len(SUPABASE_URL)}")
+    print(f"DEBUG SUPABASE_SERVICE_KEY length: {len(SUPABASE_SERVICE_KEY)}")
+
     today = datetime.now(timezone.utc).date().isoformat()
     now = datetime.now(timezone.utc).isoformat()
     any_success = False
@@ -166,8 +170,9 @@ def run():
             })
         supabase_upsert("climate_alerts", alert_rows)
         print(f"ReliefWeb: {len(reports)} report(s) in the last 7 days")
-    except Exception as e:
-        print(f"[warn] ReliefWeb fetch failed: {type(e).__name__}: {e}")
+    except Exception:
+        print("[warn] ReliefWeb step failed. Full traceback:")
+        traceback.print_exc()
 
     # 2. World Bank indicators
     for code, metric in WB_INDICATORS.items():
@@ -175,19 +180,21 @@ def run():
             result = fetch_world_bank(code)
             if result:
                 year, value = result
+                print(f"{metric}: {value} ({year}) — fetch OK, now saving to Supabase...")
                 supabase_upsert("climate_readings", [{
                     "metric": metric, "value": value, "value_text": f"{year}",
                     "observed_at": today, "source": "World Bank", "fetched_at": now,
                 }])
                 any_success = True
-                print(f"{metric}: {value} ({year})")
-        except Exception as e:
-            print(f"[warn] World Bank fetch failed for {code}: {type(e).__name__}: {e}")
+        except Exception:
+            print(f"[warn] World Bank step failed for {code}. Full traceback:")
+            traceback.print_exc()
         time.sleep(0.3)
 
     # 3. CBG policy rate & inflation
     try:
         readings = fetch_cbg_readings()
+        print(f"CBG readings fetched OK: {readings} — now saving to Supabase...")
         rows = [{
             "metric": k, "value": v, "value_text": None,
             "observed_at": today, "source": "CBG", "fetched_at": now,
@@ -195,15 +202,15 @@ def run():
         supabase_upsert("climate_readings", rows)
         if rows:
             any_success = True
-        print(f"CBG readings: {readings}")
-    except Exception as e:
-        print(f"[warn] CBG fetch failed: {type(e).__name__}: {e}")
+    except Exception:
+        print("[warn] CBG step failed. Full traceback:")
+        traceback.print_exc()
 
     print("Done. Unreviewed alerts are in climate_alerts — check the dashboard's Overview tab.")
 
     if not any_success:
         # Every source failed — don't report a false "Success" to GitHub Actions.
-        raise SystemExit("All data sources failed this run — see [warn] lines above for the real cause. Exiting with failure so this shows red, not green.")
+        raise SystemExit("All data sources failed this run — see tracebacks above for the real cause. Exiting with failure so this shows red, not green.")
 
 
 if __name__ == "__main__":
